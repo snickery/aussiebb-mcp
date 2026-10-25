@@ -1,12 +1,7 @@
-import functools
-import hmac
-import inspect
-import json
 import logging
-import time
 
-import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp_server_kit import offload_sync_tools, serve
 
 from aussiebb_mcp.abb_client import (
     TESTS,
@@ -15,7 +10,6 @@ from aussiebb_mcp.abb_client import (
 )
 from aussiebb_mcp.config import MCP_BEARER_TOKEN, PORT
 
-logger = logging.getLogger(__name__)
 
 client = AussieBBClient()
 
@@ -59,106 +53,7 @@ mcp = FastMCP(
     stateless_http=True,
     json_response=True,
 )
-
-
-# --- Run blocking tool handlers off the event loop -----------------------
-# The MCP SDK runs sync tools inline on the single event loop, so a blocking
-# upstream HTTP call — or a 3-minute test poll — would stall every
-# concurrent request. Each sync tool is registered as an async wrapper that
-# runs the body in a worker thread; the original sync fn is returned so the
-# module name stays directly callable for unit tests. httpx.Client is
-# thread-safe; login is lock-guarded in the client.
-req_logger = logging.getLogger("aussiebb_mcp.requests")
-if not req_logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    req_logger.addHandler(_h)
-    req_logger.setLevel(logging.INFO)
-    req_logger.propagate = False
-
-
-def _rss_mib() -> int:
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * 4096 // (1024 * 1024)
-    except Exception:
-        return -1
-
-
-_orig_tool = mcp.tool
-
-
-def _threaded_tool(*d_args, **d_kwargs):
-    register = _orig_tool(*d_args, **d_kwargs)
-
-    def decorator(fn):
-        if inspect.iscoroutinefunction(fn):
-            return register(fn)
-
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            start = time.perf_counter()
-            outcome = "ok"
-            try:
-                return await anyio.to_thread.run_sync(
-                    functools.partial(fn, *args, **kwargs)
-                )
-            except Exception:
-                outcome = "error"
-                raise
-            finally:
-                req_logger.info(
-                    "tool=%s outcome=%s duration_ms=%d rss_mib=%d",
-                    fn.__name__, outcome,
-                    int((time.perf_counter() - start) * 1000),
-                    _rss_mib(),
-                )
-
-        wrapper.__signature__ = inspect.signature(fn)
-        register(wrapper)
-        return fn
-
-    return decorator
-
-
-mcp.tool = _threaded_tool
-
-
-class BearerAuthMiddleware:
-    """Pure ASGI bearer-token middleware (streaming-safe, timing-safe compare)."""
-
-    def __init__(self, app, expected_token: str):
-        self.app = app
-        self.expected_token = expected_token
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket"):
-            path = scope.get("path", "")
-            if path.startswith("/.well-known/"):
-                return await self.app(scope, receive, send)
-            headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer "):
-                token = auth[7:]
-                if hmac.compare_digest(token, self.expected_token):
-                    return await self.app(scope, receive, send)
-            client_host = scope.get("client", ("unknown",))[0]
-            if client_host in ("127.0.0.1", "::1"):
-                logger.debug("Health probe 401 (loopback, expected)")
-            else:
-                logger.warning(
-                    "Rejected request: invalid or missing bearer token from %s",
-                    client_host,
-                )
-            body = json.dumps({"error": "unauthorized"}).encode()
-            await send({"type": "http.response.start", "status": 401, "headers": [
-                [b"content-type", b"application/json"],
-                [b"content-length", str(len(body)).encode()],
-            ]})
-            await send({"type": "http.response.body", "body": body})
-            return
-        await self.app(scope, receive, send)
+offload_sync_tools(mcp, logger_name="aussiebb_mcp.requests")
 
 
 def _service_label(sid: int) -> dict:
@@ -389,25 +284,9 @@ def run_diagnostic(
 
 
 def main():
-    import sys
-
     logging.basicConfig(level=logging.INFO)
 
-    if "--stdio" in sys.argv:
-        mcp.run(transport="stdio")
-        return
-
-    import uvicorn
-
-    if not MCP_BEARER_TOKEN:
-        raise SystemExit(
-            "MCP_BEARER_TOKEN is not set. Refusing to start an unauthenticated "
-            "MCP server. Set it in .secrets.env and restart."
-        )
-    app = BearerAuthMiddleware(
-        mcp.streamable_http_app(), expected_token=MCP_BEARER_TOKEN,
-    )
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    serve(mcp, port=PORT, bearer_token=MCP_BEARER_TOKEN)
 
 
 if __name__ == "__main__":
